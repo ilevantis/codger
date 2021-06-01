@@ -1,0 +1,497 @@
+#! /usr/bin/env python3
+import argparse, sys
+
+codon_table = {'GGG': 'G', 'AGG': 'R', 'TGG': 'W', 'CGG': 'R',
+               'GGA': 'G', 'AGA': 'R', 'TGA': '*', 'CGA': 'R',
+               'GGT': 'G', 'AGT': 'S', 'TGT': 'C', 'CGT': 'R',
+               'GGC': 'G', 'AGC': 'S', 'TGC': 'C', 'CGC': 'R',
+               'GAG': 'E', 'AAG': 'K', 'TAG': '*', 'CAG': 'Q',
+               'GAA': 'E', 'AAA': 'K', 'TAA': '*', 'CAA': 'Q',
+               'GAT': 'D', 'AAT': 'N', 'TAT': 'Y', 'CAT': 'H',
+               'GAC': 'D', 'AAC': 'N', 'TAC': 'Y', 'CAC': 'H',
+               'GTG': 'V', 'ATG': 'M', 'TTG': 'L', 'CTG': 'L',
+               'GTA': 'V', 'ATA': 'I', 'TTA': 'L', 'CTA': 'L',
+               'GTT': 'V', 'ATT': 'I', 'TTT': 'F', 'CTT': 'L',
+               'GTC': 'V', 'ATC': 'I', 'TTC': 'F', 'CTC': 'L',
+               'GCG': 'A', 'ACG': 'T', 'TCG': 'S', 'CCG': 'P',
+               'GCA': 'A', 'ACA': 'T', 'TCA': 'S', 'CCA': 'P',
+               'GCT': 'A', 'ACT': 'T', 'TCT': 'S', 'CCT': 'P',
+               'GCC': 'A', 'ACC': 'T', 'TCC': 'S', 'CCC': 'P' }
+
+def translate_codon(codon, is_ref):
+    codon = codon.upper().replace('-','')
+    try:
+        aa = codon_table[codon]
+    except KeyError:
+        if len(codon) == 0:
+            aa = '-'
+        elif len(codon) == 3:
+            aa = 'X'
+        elif len(codon) < 3 and is_ref:
+            aa = '?'
+        elif len(codon) > 3 and is_ref:
+            aa = '&'
+        elif len(codon) < 3 and not is_ref:
+            aa = '!'
+        elif len(codon) > 3 and not is_ref:
+            aa = '!'
+        else:
+            raise
+    return aa
+
+
+def SimpleFastaParser(handle):
+# adapted from biopython Bio.SeqIO.FastaIO SimpleFastaParser
+    l = next(handle)
+    try:
+        while True:
+            title = l[1:].rstrip()
+            lines = []
+            l = next(handle)
+            while l[0] != ">":
+                lines.append(l.rstrip())
+                l = next(handle)
+            yield title, "".join(lines).replace(" ", "").replace("\r", "")
+    except StopIteration:
+        yield title, "".join(lines).replace(" ", "").replace("\r", "")
+        return
+
+
+def get_cdn_info(cdn_labels):
+    cdn_idxs = []; cdn_ref = []
+    start = is_ref = None
+    for i, char in enumerate(cdn_labels):
+        if char == 'N':
+            stop = i
+            cdn_idxs.append((start, stop))
+            cdn_ref.append(is_ref)
+
+            start = i
+            is_ref = True
+
+        elif char == 'n':
+            stop = i
+            cdn_idxs.append((start, stop))
+            cdn_ref.append(is_ref)
+
+            start = i
+            is_ref = False
+
+        else:
+            pass
+
+    i += 1
+    stop = i
+    cdn_idxs.append((start, stop))
+    cdn_ref.append(is_ref)
+
+    return cdn_idxs[1:], cdn_ref[1:]
+
+
+def CodonAliParser(handle):
+    sfp = SimpleFastaParser(handle)
+    id1, cdn_labels = next(sfp)
+    assert id1 == 'CODONS'
+    for i in range(0, len(cdn_labels), 3):
+        assert cdn_labels[i:i+3] in ['---', 'N--', 'n--']
+
+    cdn_idxs, cdn_ref = get_cdn_info(cdn_labels)
+
+    na_ali = {}
+    for id, seq in sfp:
+        yield id, [ (seq[slice(*idx)], cdn_ref[i] ) for i,idx in enumerate(cdn_idxs) ]
+
+
+def dict_to_cols(ali_dict):
+    '''
+    Convert aa_ali dict to alignment by column (list of cols, where col is list of
+    residues in aligment col).
+    aa_ali: {record_id: aa_alignment_string}
+    return: ali_idx, [['aa','aa','aa'],['aa','aa','aa']]
+    '''
+    ali_cols = []
+    ali_idx = list(ali_dict.keys())
+    i = 0
+    while True:
+        try:
+            col = []
+            for id in ali_idx:
+                col.append(ali_dict[id][i])
+            ali_cols.append(col)
+            i += 1
+        except IndexError:
+            break
+    return ali_idx, ali_cols
+
+
+def cols_to_dict(ali_cols, ali_idx):
+    ali_dict = { id:[ col[r] for col in ali_cols ]
+        for r, id in enumerate(ali_idx) }
+    return ali_dict
+
+
+pad_codon = lambda cdn,width: (cdn[0] + '-'*(width-len(cdn[0])), cdn[1])
+def pad_col(col):
+    width = max(len(cdn[0]) for cdn in col)
+    width += -width % 3
+    padded_col = [ pad_codon(cdn,width) for cdn in col ]
+    return padded_col
+
+
+def align_cdns_by_aa(na_cdns, aa_ali):
+    # na_cdns must be unaligned - i.e no gap codons (but gaps inside codon is fine)
+
+    # get index and columwise list of AA alignment
+    # index should only contain keys from within na_cdns
+    ali_idx, aa_cols = dict_to_cols(aa_ali)
+
+    # now we iterate through aa_cols, replacing each aa with the corresponding codon
+    # from na_cdns and adding in columns where seqs in na_cdns have a '!' codon
+    counters = {id:0 for id in ali_idx}
+    new_cols = []
+
+    for c, col in enumerate(aa_cols):
+        insert_col = [('---',False)]*len(ali_idx)
+        r = 0
+        while r < len(col):
+            id = ali_idx[r]
+            ali_a = col[r]
+
+            try:
+                cdn = na_cdns[id][counters[id]]
+                tr_a = translate_codon(*cdn)
+            except IndexError:
+                cdn = None
+                tr_a = None
+
+
+            if ali_a == '-':
+                col[r] = ('---',True)
+                r += 1
+
+            elif any([
+                ali_a.upper() == tr_a.upper(),
+                ali_a.upper() == 'X' and tr_a == '&',
+                ali_a.upper() == 'X' and tr_a == '?',
+                ali_a.upper() == 'X' and tr_a == '*'
+            ]):
+                col[r] = (cdn[0],True)
+                counters[id] += 1
+                r += 1
+
+            elif tr_a  == '!':
+                insert_col[r] = (cdn[0],False)
+                counters[id] += 1
+
+            else:
+                print('AAs not equal: {} col {} is "{}", unexpected codon "{}" ({}) in codon alignment.'.format(id,c,ali_a,cdn[0],tr_a), file=sys.stderr)
+                raise
+
+
+        if any(True for cdn in insert_col if len(cdn[0].replace('-','')) > 0):
+            new_cols.append(pad_col(insert_col))
+
+        # remove excess padding and completely empty/inter-hit cols
+        col = [(cdn[0].rstrip('n-'), cdn[1]) for cdn in col]
+        if max(len(cdn[0]) for cdn in col) > 0:
+            new_cols.append(pad_col(col))
+
+    # for i,col in enumerate(new_cols):
+    #     assert all(c[1]==col[0][1] for c in col[1:]), "col {} not all same ref value".format(i)
+
+    na_ali = cols_to_dict(new_cols, ali_idx)
+
+    return na_ali
+
+
+def is_ambig(col, cutoff=1.0, exclude_rows=[]):
+    '''
+    tests if a column has a higher proportion of ambiguous codons than threshold amount.
+    exclude_rows : list of integer row ids to exclude from the calculation. Useful to look at
+    ambiguity in only sequences newly added to a backbone alignment.
+    '''
+    if len(exclude_rows)>0:
+        include_rows = set(range(len(col))) - set(exclude_rows)
+        col = [ col[i] for i in include_rows ]
+
+    pc_ambig = 1 - (sum(1 for cdn in col if cdn[0] in codon_table.keys()) / len(col))
+    if pc_ambig >= cutoff:
+        return True
+    else:
+        return False
+
+
+def trim_cols(cols, remove_idx):
+    '''
+    remove_idx: list of integer IDs of which cols to remove
+    '''
+    include_cols = set(range(len(cols))) - set(remove_idx)
+    include_cols = sorted(list(include_cols)) # ensure cols stay in same order
+    cols = [cols[i] for i in include_cols]
+    return cols
+
+
+def trim_codons(na_ali):
+    '''
+    Trim columns with >3bp codons down to 3bp. Codons with <=3bp stay unchanged,
+    codons with >3bp are masked as ambiguous i.e. "NNN".
+    '''
+    for id in na_ali.keys():
+        for i in range(ali_len):
+            cdn = na_ali[id][i]
+            if len(cdn[0].replace('-','')) > 3:
+                na_ali[id][i] = ('NNN',cdn[1])
+            else:
+                na_ali[id][i] = (cdn[0][:3],cdn[1])
+    return na_ali
+
+
+def update_ref_cols(na_ali, ref_idx):
+    '''
+    na_ali: codon alingment dict
+    ref_idx: list of columns to be marked as reference
+    '''
+    ali_len = len(next(iter(na_ali.values())))
+    for id in na_ali.keys():
+        for i in range(ali_len):
+            if i in ref_idx:
+                na_ali[id][i] = (na_ali[id][i][0],True)
+            else:
+                na_ali[id][i] = (na_ali[id][i][0],False)
+    return na_ali
+
+
+def write_aa_out(na_ali_iter, handle, extended_chars=False):
+    for id,cdns in na_ali_iter:
+        aa_str = ''.join([translate_codon(*cdn) for cdn in cdns])
+        if not extended_chars:
+            aa_str = (aa_str.replace('&','X')
+                            .replace('?','X')
+                            .replace('*','X')
+                            .replace('!','-') )
+        print(">" + id, file=handle)
+        print(aa_str, file=handle)
+
+
+def write_na_out(na_ali_iter, handle):
+    ref_done = False
+    for id,cdns in na_ali_iter:
+
+        if not ref_done:
+            ref_str = ''
+            for cdn in cdns:
+                if cdn[1] == True:
+                    ref_str += 'N' + '-'*(len(cdn[0])-1)
+                else:
+                    ref_str += 'n' + '-'*(len(cdn[0])-1)
+
+            print(">CODONS", file=handle)
+            print(ref_str, file=handle)
+            ref_done = True
+
+        na_str = ''.join([cdn[0] for cdn in cdns])
+        print(">" + id, file=handle)
+        print(na_str, file=handle)
+
+
+
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# top level commands
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+def cmd__translate(args):
+    for handle in args.cdn_fastas:
+        write_aa_out(CodonAliParser(handle), args.out,
+            extended_chars=args.extended_chars)
+
+
+def cmd__aaalign(args):
+    na_ali = { id:cdns for handle in args.cdn_fastas for id,cdns in CodonAliParser(handle) }
+    aa_ali = { id:seq for id,seq in SimpleFastaParser(args.aa) }
+
+    # throw away gap codons in prep for realignment
+    for id in na_ali.keys():
+        na_ali[id] = [ cdn for cdn in na_ali[id] if len(cdn[0].replace('-','')) > 0 ]
+
+    # realign codons by amino acid alignment
+    na_ali = align_cdns_by_aa(na_ali, aa_ali)
+
+    write_na_out(na_ali.items(), args.out)
+
+
+def cmd__setref(args):
+    na_ali = { id:cdns for id,cdns in CodonAliParser(args.cdn_fasta) }
+
+    if args.refs:
+        if args.refs.name.split('.')[-1] in ('fa','fasta'):
+            ref_ids = [ id for id,_ in SimpleFastaParser(args.refs) ]
+        else:
+            ref_ids = [ l.strip() for l in args.ref ]
+
+    new_refs = set()
+
+    if args.keep_refs:
+        for id,codons in na_ali.items():
+            if id in ref_ids:
+                for i,cdn in enumerate(codons):
+                    if len(cdn[0].replace('-','')) > 0:
+                        new_refs.add(i)
+
+    if args.remove_ambigs:
+        ali_idx, ali_cols = dict_to_cols(na_ali)
+        if args.refs:
+            ref_rows = [ i for i,id in enumerate(ali_idx) if id in ref_ids ]
+        else:
+            ref_rows = []
+
+        ambig_cols = { i for i,col in enumerate(ali_cols)
+            if not is_ambig(col, cutoff=args.ambig_pc, exclude_rows=ref_rows) }
+        new_refs.update(ambig_cols)
+
+    na_ali = update_ref_cols(na_ali, new_refs)
+
+    write_na_out(na_ali.items(), args.out)
+
+
+def cmd__trim(args):
+    na_ali = { id:cdns for id,cdns in CodonAliParser(args.cdn_fasta) }
+
+    ali_idx, ali_cols = dict_to_cols(na_ali); del na_ali
+    ali_cols = [ col for col in ali_cols if col[0][1] == True ]
+
+    na_ali = cols_to_dict(ali_cols,ali_idx); del ali_idx, ali_cols
+    write_na_out(na_ali.items(), args.out)
+
+
+def cmd__chop(args):
+    chop = lambda cdn: ('NNN',cdn[1]) if len(cdn[0].replace('-','')) > 3 else (cdn[0][:3],cdn[1])
+    chopped = ( (id,[chop(cdn) for cdn in cdns]) for id,cdns in CodonAliParser(args.cdn_fasta) )
+    write_na_out(chopped, args.out)
+
+
+def cmd__thin(args):
+    num_ref_cdns = lambda cdns: sum(1 for cdn in cdns if cdn[1])
+    keep = ( r for r in CodonAliParser(args.cdn_fasta) if num_ref_cdns(r[1]) >= args.length )
+    write_na_out(keep, args.out)
+
+
+def cmd__filter(args):
+    # remove listed seqs / seqs in other fasta
+    if args.ids.name.split('.')[-1] in ('fa','fasta'):
+        ids = [ id for id,_ in SimpleFastaParser(args.ids) ]
+    else:
+        ids = [ l.strip() for l in args.ref ]
+
+    if args.exclude:
+        keep = ( r for r in CodonAliParser(args.cdn_fasta) if r[0] not in ids )
+    elif args.include:
+        keep = ( r for r in CodonAliParser(args.cdn_fasta) if r[0] in ids )
+
+    write_na_out(keep, args.out)
+
+
+
+
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# CLI
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+
+if __name__ == "__main__":
+
+    # create the top-level parser
+    parser = argparse.ArgumentParser(prog='codger')
+
+    # create parent parsers for multi-use arguments
+    parent_out_parser = argparse.ArgumentParser(add_help=False)
+    parent_out_parser.add_argument('-o','--out',
+        type=argparse.FileType('w'), default=sys.stdout,
+    	help="Output file name.")
+
+    parent_multi_in_parser = argparse.ArgumentParser(add_help=False)
+    parent_multi_in_parser.add_argument('cdn_fastas', nargs='+',
+        type=argparse.FileType('r'), default=sys.stdin,
+    	help="One or more explicit codon aligned fastas.")
+
+    parent_single_in_parser = argparse.ArgumentParser(add_help=False)
+    parent_single_in_parser.add_argument('cdn_fasta',
+        type=argparse.FileType('r'), default=sys.stdin,
+    	help="An explicit codon aligned fasta.")
+
+    # create subparsers for each subcommand
+    subparsers = parser.add_subparsers(help='sub-command help')
+
+    prsr_translate = subparsers.add_parser('translate',
+        help="Translate and combine multiple codon alignment files into an AA alignment.",
+        description="Translate and combine a single or multiple codon alignment files into an amino acid alignment. When multiple codon aligned fastas are given, sequences in the output AA alignment will not be properly aligned to all other sequences.",
+        parents=[parent_out_parser, parent_multi_in_parser])
+    prsr_translate.add_argument('-e', '--extended-chars', action='store_true',
+        help="Tranlsate frameshifted codons into specific characters: ? - bp deletion; & - bp insertion; ! - multi bp frameshifting insertion.")
+    prsr_translate.set_defaults(func=cmd__translate)
+
+
+    prsr_aaalign = subparsers.add_parser('aaalign',
+        help="Align multiple codon alignment files based on a corresponding AA alignment.",
+        description="Align multiple codon alignment files based on a corresponding AA alignment.",
+        parents=[parent_out_parser, parent_multi_in_parser])
+    prsr_aaalign.add_argument('-a','--aa', type=argparse.FileType('r'), required=True,
+        help="Amino acid alignment corresponding to the codon alignment files.")
+    prsr_aaalign.set_defaults(func=cmd__aaalign)
+
+
+    prsr_setref = subparsers.add_parser('setref',
+        help="Modify the reference codon-column row based on ambiguity of codons or reference sequences.",
+        description="Modify the reference codon-column row based on percent of ambiguous codons in a column or based on reference sequences.",
+        parents=[parent_out_parser, parent_single_in_parser])
+    prsr_setref.add_argument('-r','--refs', type=argparse.FileType('r'),
+        help="A file listing sequence IDs (one per line) of sequences to be used as reference sequences in the alignment. A fasta file can also be used, in which case all IDs in the provided fasta file determine reference sequences.")
+    prsr_setref.add_argument('-k','--keep-refs', action='store_true',
+        help="All codon-columns containing a codon in a reference sequence are marked as reference codon-columns.")
+    prsr_setref.add_argument('-a','--remove-ambigs', action='store_true',
+        help="Codon-columns cotaining higher than X proportion of ambiguous codons are marked as non-reference. If --refs is given, proportion is calculated excluding reference sequence rows.")
+    prsr_setref.add_argument('-p','--ambig-pc', type=float, default=1.0,
+        help="Threshold proportion of ambiguous codons to mark codon-column as nopn-reference. Default: 1.0")
+    prsr_setref.set_defaults(func=cmd__setref)
+
+
+    prsr_trim = subparsers.add_parser('trim',
+        help="Trim out codon-columns marked as non-reference codons.",
+        description="Remove codon-columns marked as non-reference from the alignment.",
+        parents=[parent_out_parser, parent_single_in_parser])
+    prsr_trim.set_defaults(func=cmd__trim)
+
+
+    prsr_chop = subparsers.add_parser('chop',
+        help="Chop codon-columns wider than 3bp down to size.",
+        description="Chop codon-columns longer than 3bp down to size. Codons wider than 3bp in a codon-column will be replaced with 'NNN'.",
+        parents=[parent_out_parser, parent_single_in_parser])
+    prsr_chop.set_defaults(func=cmd__chop)
+
+
+    prsr_thin = subparsers.add_parser('thin',
+        help="Remove sequences containing fewer than X reference codons.",
+        description="Remove all sequences containing fewer than X codons marked as reference codons in the alignment.",
+        parents=[parent_out_parser, parent_single_in_parser])
+    prsr_thin.add_argument('-l','--length', type=int, required=True,
+        help="Minimum number of codons marked as reference for a sequence to be kept.")
+    prsr_thin.set_defaults(func=cmd__thin)
+
+
+    prsr_filter = subparsers.add_parser('filter',
+        help="Filter sequences by a provided list of sequence IDs.",
+        description="Exclude or include sequences based on their sequence ID.",
+        parents=[parent_out_parser, parent_single_in_parser])
+    prsr_filter.add_argument('--ids', type=argparse.FileType('r'), required=True,
+        help="A file listing sequence IDs (one per line) to include or exclude from the alignment. A fasta file can also be used, in which case all IDs in the provided fasta file are used as IDs to include/exclude.")
+    egroup = prsr_filter.add_mutually_exclusive_group(required=True)
+    egroup.add_argument('-i', "--include", action='store_true',
+        help="Only sequence IDs in the ID file are included in the output.")
+    egroup.add_argument('-e', "--exclude", action='store_true',
+        help="Sequence IDs in the ID file are excluded in the output.")
+
+    prsr_filter.set_defaults(func=cmd__filter)
+
+    # parse the args and call whatever function was selected
+    args = parser.parse_args()
+    args.func(args)
